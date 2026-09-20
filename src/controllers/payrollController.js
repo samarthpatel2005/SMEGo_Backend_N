@@ -5,24 +5,110 @@ const Timesheet = require('../models/Timesheet');
 const razorpay = require('../config/razorpay');
 const mongoose = require('mongoose');
 
+const getOrganizationId = (user) => user.organization?._id || user.organization;
+
+const getPayrollPeriod = (values) => {
+  const { year, month, startDate, endDate } = values;
+  if ((startDate && !endDate) || (!startDate && endDate)) {
+    throw new Error('Both start date and end date are required');
+  }
+
+  const rangeStart = startDate ? new Date(`${startDate}T00:00:00`) : new Date(Number(year), Number(month) - 1, 1);
+  const rangeEnd = endDate ? new Date(`${endDate}T23:59:59.999`) : new Date(Number(year), Number(month), 0, 23, 59, 59, 999);
+  if (Number.isNaN(rangeStart.getTime()) || Number.isNaN(rangeEnd.getTime()) || rangeStart > rangeEnd) {
+    throw new Error('A valid payroll date range is required');
+  }
+
+  return {
+    year: rangeStart.getFullYear(),
+    month: rangeStart.getMonth() + 1,
+    startDate: rangeStart,
+    endDate: rangeEnd
+  };
+};
+
+const getSalaryStructure = async (req, res) => {
+  try {
+    const employee = await Employee.findOne({
+      _id: req.params.employeeId,
+      organization: getOrganizationId(req.user)
+    }).select('fullName employeeId salaryStructure');
+
+    if (!employee) {
+      return res.status(404).json({ success: false, message: 'Employee not found' });
+    }
+
+    res.json({ success: true, data: employee });
+  } catch (error) {
+    console.error('Get salary structure error:', error);
+    res.status(500).json({ success: false, message: 'Internal server error', error: error.message });
+  }
+};
+
+const updateSalaryStructure = async (req, res) => {
+  try {
+    const {
+      salaryType,
+      salary,
+      hourlyRate,
+      bonus = 0,
+      fixedDeduction = 0,
+      leaveDeductionPerDay = 0,
+      halfDayDeductionPerDay = 0
+    } = req.body;
+
+    if (!['monthly', 'hourly'].includes(salaryType)) {
+      return res.status(400).json({ success: false, message: 'Salary type must be monthly or hourly' });
+    }
+    if (salaryType === 'monthly' && (!Number.isFinite(Number(salary)) || Number(salary) < 0)) {
+      return res.status(400).json({ success: false, message: 'Monthly salary is required' });
+    }
+    if (salaryType === 'hourly' && (!Number.isFinite(Number(hourlyRate)) || Number(hourlyRate) < 0)) {
+      return res.status(400).json({ success: false, message: 'Hourly rate is required' });
+    }
+
+    const employee = await Employee.findOne({
+      _id: req.params.employeeId,
+      organization: getOrganizationId(req.user)
+    });
+
+    if (!employee) {
+      return res.status(404).json({ success: false, message: 'Employee not found' });
+    }
+
+    employee.salaryStructure = {
+      salaryType,
+      salary: Number(salary) || 0,
+      hourlyRate: Number(hourlyRate) || 0,
+      bonus: Math.max(Number(bonus) || 0, 0),
+      fixedDeduction: Math.max(Number(fixedDeduction) || 0, 0),
+      leaveDeductionPerDay: Math.max(Number(leaveDeductionPerDay) || 0, 0),
+      halfDayDeductionPerDay: Math.max(Number(halfDayDeductionPerDay) || 0, 0),
+      effectiveFrom: employee.salaryStructure?.effectiveFrom || new Date(),
+      updatedBy: req.user.id
+    };
+
+    await employee.save();
+    res.json({ success: true, message: 'Salary structure saved successfully', data: employee.salaryStructure });
+  } catch (error) {
+    console.error('Update salary structure error:', error);
+    res.status(500).json({ success: false, message: 'Failed to save salary structure', error: error.message });
+  }
+};
+
 // Get all employees for payroll
 const getEmployeesForPayroll = async (req, res) => {
   try {
-    const { year, month } = req.query;
-    const organizationId = req.user.organization;
-    
-    // Get existing payroll records for this period
-    const existingPayrolls = await Payroll.find({
-      organization: organizationId,
-      'payrollPeriod.year': parseInt(year),
-      'payrollPeriod.month': parseInt(month),
-      status: 'paid'
-    }).populate('employee', 'firstName lastName email');
+    const { year, month, startDate, endDate } = req.query;
+    const organizationId = getOrganizationId(req.user);
 
-    if (!year || !month) {
+    let period;
+    try {
+      period = getPayrollPeriod({ year, month, startDate, endDate });
+    } catch (error) {
       return res.status(400).json({
         success: false,
-        message: 'Year and month are required'
+        message: error.message
       });
     }
 
@@ -30,40 +116,42 @@ const getEmployeesForPayroll = async (req, res) => {
     const employees = await Employee.find({
       organization: organizationId,
       isActive: true
-    }).select('fullName email employeeId department position salary salaryType hourlyRate hireDate')
+    }).select('fullName email employeeId department position salary salaryType hourlyRate salaryStructure hireDate')
       .sort({ fullName: 1 });
 
     // Calculate payroll data for each employee based on attendance
     const employeesWithPayroll = await Promise.all(
       employees.map(async (employee) => {
-        // Get attendance summary for the employee for the given month
-        const attendanceSummary = await Timesheet.getMonthlyAttendanceSummary(
+        // Get attendance summary for the employee for the selected period
+        const attendanceSummary = await Timesheet.getAttendanceSummary(
           employee._id,
-          parseInt(year),
-          parseInt(month),
+          period.startDate,
+          period.endDate,
           organizationId
         );
 
-        // Calculate payroll amounts
-        const payrollData = await Payroll.calculatePayroll(
-          employee._id,
-          parseInt(year),
-          parseInt(month),
-          organizationId
-        );
+        const hasSalaryStructure = !!employee.salaryStructure?.salaryType;
+        const payrollData = hasSalaryStructure
+          ? await Payroll.calculatePayroll(employee._id, period, organizationId)
+          : null;
 
         // Check if payroll already exists
         const existingPayroll = await Payroll.findOne({
           employee: employee._id,
           organization: organizationId,
-          'payrollPeriod.year': parseInt(year),
-          'payrollPeriod.month': parseInt(month)
+          'payrollPeriod.year': period.year,
+          'payrollPeriod.month': period.month,
+          ...(startDate && endDate ? {
+            'payrollPeriod.startDate': period.startDate,
+            'payrollPeriod.endDate': period.endDate
+          } : {})
         });
 
         return {
           employee: employee.toObject(),
           attendance: attendanceSummary,
           payrollData,
+          hasSalaryStructure,
           hasExistingPayroll: !!existingPayroll,
           existingPayrollId: existingPayroll?._id,
           payrollStatus: existingPayroll?.status || 'not_generated'
@@ -75,7 +163,12 @@ const getEmployeesForPayroll = async (req, res) => {
       success: true,
       data: {
         employees: employeesWithPayroll,
-        period: { year: parseInt(year), month: parseInt(month) }
+        period: {
+          year: period.year,
+          month: period.month,
+          startDate: period.startDate.toISOString().slice(0, 10),
+          endDate: period.endDate.toISOString().slice(0, 10)
+        }
       }
     });
 
@@ -92,28 +185,48 @@ const getEmployeesForPayroll = async (req, res) => {
 // Generate payroll for specific employees
 const generatePayrollForEmployees = async (req, res) => {
   try {
-    const { year, month, employeeIds } = req.body;
-    const organizationId = req.user.organization;
+    const { year, month, startDate, endDate, employeeIds } = req.body;
+    const organizationId = getOrganizationId(req.user);
     const createdBy = req.user.id;
 
-    if (!year || !month || !employeeIds || !Array.isArray(employeeIds)) {
+    if (!employeeIds || !Array.isArray(employeeIds)) {
       return res.status(400).json({
         success: false,
-        message: 'Year, month, and employee IDs are required'
+        message: 'Employee IDs are required'
       });
+    }
+
+    let period;
+    try {
+      period = getPayrollPeriod({ year, month, startDate, endDate });
+    } catch (error) {
+      return res.status(400).json({ success: false, message: error.message });
     }
 
     const results = [];
 
     for (const employeeId of employeeIds) {
       try {
+        const employee = await Employee.findOne({ _id: employeeId, organization: organizationId });
+        if (!employee) {
+          throw new Error('Employee not found in this organization');
+        }
+        if (!employee.salaryStructure || !employee.salaryStructure.salaryType) {
+          throw new Error('Salary structure must be set before generating payroll');
+        }
+
         // Check if payroll already exists
-        const existingPayroll = await Payroll.findOne({
+        const existingPayrollQuery = {
           employee: employeeId,
           organization: organizationId,
-          'payrollPeriod.year': year,
-          'payrollPeriod.month': month
-        });
+          'payrollPeriod.year': period.year,
+          'payrollPeriod.month': period.month
+        };
+        if (startDate && endDate) {
+          existingPayrollQuery['payrollPeriod.startDate'] = period.startDate;
+          existingPayrollQuery['payrollPeriod.endDate'] = period.endDate;
+        }
+        const existingPayroll = await Payroll.findOne(existingPayrollQuery);
 
         if (existingPayroll) {
           results.push({
@@ -128,8 +241,7 @@ const generatePayrollForEmployees = async (req, res) => {
         // Calculate payroll
         const payrollData = await Payroll.calculatePayroll(
           employeeId,
-          year,
-          month,
+          period,
           organizationId
         );
 
@@ -181,7 +293,7 @@ const generatePayrollForEmployees = async (req, res) => {
 const createPayrollPayment = async (req, res) => {
   try {
     const { payrollIds, customAmount } = req.body;
-    const organizationId = req.user.organization;
+    const organizationId = getOrganizationId(req.user);
 
     if (!payrollIds || !Array.isArray(payrollIds) || payrollIds.length === 0) {
       return res.status(400).json({
@@ -210,8 +322,7 @@ const createPayrollPayment = async (req, res) => {
       totalAmount = Math.max(customAmount, 1); // Minimum ₹1
     } else {
       totalAmount = payrolls.reduce((sum, payroll) => {
-        // Use baseSalary instead of netSalary to avoid calculation issues
-        const amount = payroll.baseSalary || payroll.netSalary || 1000; // Default to 1000 if no salary
+        const amount = payroll.netSalary || payroll.baseSalary || 1000;
         return sum + Math.max(amount, 1);
       }, 0);
     }
@@ -235,10 +346,10 @@ const createPayrollPayment = async (req, res) => {
 
     // Store payment info in payrolls
     for (const payroll of payrolls) {
-      const paymentAmount = customAmount && payrolls.length === 1 
-        ? customAmount 
-        : (payroll.baseSalary || payroll.netSalary || 1000);
-      
+      const paymentAmount = customAmount && payrolls.length === 1
+        ? customAmount
+        : (payroll.netSalary || payroll.baseSalary || 1000);
+
       // Update payroll using updateOne to avoid validation issues
       await Payroll.updateOne(
         { _id: payroll._id },
@@ -260,9 +371,9 @@ const createPayrollPayment = async (req, res) => {
         payrolls: payrolls.map(p => ({
           _id: p._id,
           employee: p.employee,
-          amount: customAmount && payrolls.length === 1 
-            ? customAmount 
-            : (p.baseSalary || p.netSalary || 1000)
+          amount: customAmount && payrolls.length === 1
+            ? customAmount
+            : (p.netSalary || p.baseSalary || 1000)
         }))
       }
     });
@@ -290,20 +401,20 @@ const handlePayrollPaymentWebhook = async (req, res) => {
       if (notes.type === 'payroll') {
         let payrolls = [];
         let customAmount = null;
-        
+
         if (notes.payrollIds) {
           // If payrollIds are provided in notes
           const payrollIds = notes.payrollIds.split(',');
           customAmount = notes.customAmount ? parseFloat(notes.customAmount) : null;
-          
+
           payrolls = await Payroll.find({
             _id: { $in: payrollIds },
-            paymentOrderId: order.id 
+            paymentOrderId: order.id
           });
         } else {
           // If only order ID is provided, find payrolls by order ID
           payrolls = await Payroll.find({
-            paymentOrderId: order.id 
+            paymentOrderId: order.id
           });
         }
 
@@ -314,12 +425,12 @@ const handlePayrollPaymentWebhook = async (req, res) => {
           payroll.paymentMethod = 'razorpay';
           payroll.paymentReference = order.id;
           payroll.paymentDate = new Date();
-          
+
           // Use custom amount if provided for single payroll, otherwise use stored amount
           if (customAmount && payrolls.length === 1) {
             payroll.paymentAmount = customAmount;
           }
-          
+
           await payroll.save();
         }
 
@@ -346,7 +457,7 @@ const handlePayrollPaymentWebhook = async (req, res) => {
 const getPayrolls = async (req, res) => {
   try {
     const { year, month, employeeId, status, page = 1, limit = 20 } = req.query;
-    const organizationId = req.user.organization;
+    const organizationId = getOrganizationId(req.user);
 
     // Build query
     const query = { organization: organizationId };
@@ -405,7 +516,7 @@ const getPayrolls = async (req, res) => {
 const deletePayrolls = async (req, res) => {
   try {
     const { payrollIds } = req.body;
-    const organizationId = req.user.organization;
+    const organizationId = getOrganizationId(req.user);
 
     if (!payrollIds || !Array.isArray(payrollIds)) {
       return res.status(400).json({
@@ -441,7 +552,7 @@ const deletePayrolls = async (req, res) => {
 const resetPayrollStatus = async (req, res) => {
   try {
     const { payrollIds } = req.body;
-    const organizationId = req.user.organization;
+    const organizationId = getOrganizationId(req.user);
 
     if (!payrollIds || !Array.isArray(payrollIds)) {
       return res.status(400).json({
@@ -487,6 +598,8 @@ const resetPayrollStatus = async (req, res) => {
 };
 
 module.exports = {
+  getSalaryStructure,
+  updateSalaryStructure,
   getEmployeesForPayroll,
   generatePayrollForEmployees,
   createPayrollPayment,

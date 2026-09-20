@@ -59,6 +59,47 @@ const employeeSchema = new mongoose.Schema(
     hourlyRate: {
       type: Number,
     },
+    salaryStructure: {
+      salaryType: {
+        type: String,
+        enum: ['monthly', 'hourly'],
+      },
+      salary: {
+        type: Number,
+        min: 0,
+      },
+      hourlyRate: {
+        type: Number,
+        min: 0,
+      },
+      bonus: {
+        type: Number,
+        default: 0,
+        min: 0,
+      },
+      fixedDeduction: {
+        type: Number,
+        default: 0,
+        min: 0,
+      },
+      leaveDeductionPerDay: {
+        type: Number,
+        default: 0,
+        min: 0,
+      },
+      halfDayDeductionPerDay: {
+        type: Number,
+        default: 0,
+        min: 0,
+      },
+      effectiveFrom: {
+        type: Date,
+      },
+      updatedBy: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: 'User',
+      },
+    },
     hireDate: {
       type: Date,
       default: Date.now,
