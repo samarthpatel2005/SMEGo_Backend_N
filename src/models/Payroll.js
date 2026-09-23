@@ -24,6 +24,14 @@ const payrollSchema = new mongoose.Schema(
         type: Number,
         required: true,
       },
+      startDate: {
+        type: Date,
+        required: true,
+      },
+      endDate: {
+        type: Date,
+        required: true,
+      },
     },
     salaryType: {
       type: String,
@@ -174,7 +182,7 @@ payrollSchema.pre('save', function (next) {
 });
 
 // Static method to calculate payroll for an employee
-payrollSchema.statics.calculatePayroll = async function (employeeId, year, month, organizationId) {
+payrollSchema.statics.calculatePayroll = async function (employeeId, periodOrYear, monthOrOrganizationId, organizationId) {
   const Employee = mongoose.model('Employee');
   const Timesheet = mongoose.model('Timesheet');
 
@@ -184,44 +192,71 @@ payrollSchema.statics.calculatePayroll = async function (employeeId, year, month
     throw new Error('Employee not found');
   }
 
-  // Get timesheet summary for the month
-  const attendanceSummary = await Timesheet.getMonthlyAttendanceSummary(
-    employeeId,
-    year,
-    month,
-    organizationId
+  const period = typeof periodOrYear === 'object'
+    ? periodOrYear
+    : {
+      year: periodOrYear,
+      month: monthOrOrganizationId,
+      startDate: new Date(periodOrYear, monthOrOrganizationId - 1, 1),
+      endDate: new Date(periodOrYear, monthOrOrganizationId, 0),
+      organizationId
+    };
+  const resolvedOrganizationId = period.organizationId || (
+    typeof periodOrYear === 'object' ? monthOrOrganizationId : organizationId
   );
-
+  const attendanceSummary = await Timesheet.getAttendanceSummary(
+    employeeId,
+    period.startDate,
+    period.endDate,
+    resolvedOrganizationId
+  );
   // Determine salary type and base salary
-  const salaryType = employee.salary ? 'monthly' : 'hourly';
-  const baseSalary = employee.salary || 0;
-  const hourlyRate = employee.hourlyRate || 0;
+  const structure = employee.salaryStructure;
+  if (!structure || !structure.salaryType) {
+    throw new Error('Salary structure is required before generating payroll');
+  }
+
+  const salaryType = structure.salaryType;
+  const baseSalary = structure.salary || 0;
+  const hourlyRate = structure.hourlyRate || 0;
 
   // Calculate basic salary based on type
   let basicSalary = 0;
   if (salaryType === 'monthly') {
-    // For monthly salary, prorate based on working days
-    const totalDaysInMonth = attendanceSummary.totalDays;
-    const workedDays = attendanceSummary.presentDays + (attendanceSummary.halfDays * 0.5);
-    basicSalary = (baseSalary / totalDaysInMonth) * workedDays;
+    // Attendance-based leave and half-day adjustments are applied as deductions below.
+    basicSalary = baseSalary;
   } else {
     // For hourly salary
-    basicSalary = attendanceSummary.regularHours * hourlyRate;
+    basicSalary = attendanceSummary.totalHours * hourlyRate;
   }
 
-  // Calculate overtime pay (1.5x regular rate)
-  const overtimeRate = salaryType === 'hourly' ? hourlyRate * 1.5 : (baseSalary / (22 * 8)) * 1.5;
-  const overtimePay = attendanceSummary.overtimeHours * overtimeRate;
-
-  // Calculate leave deduction for unpaid leaves
-  const leaveDeduction = attendanceSummary.absentDays * (baseSalary / attendanceSummary.totalDays);
+  const dailySalary = salaryType === 'monthly'
+    ? baseSalary / Math.max(attendanceSummary.totalDays, 1)
+    : 0;
+  const unpaidLeaveDays = attendanceSummary.absentDays + attendanceSummary.leaveDays;
+  const leaveDeduction = salaryType === 'monthly'
+    ? unpaidLeaveDays * (structure.leaveDeductionPerDay ?? dailySalary)
+    : 0;
+  const halfDayDeduction = salaryType === 'monthly'
+    ? attendanceSummary.halfDays * (structure.halfDayDeductionPerDay ?? dailySalary * 0.5)
+    : 0;
+  const bonus = structure.bonus ?? 0;
+  const fixedAndHalfDayDeduction = (structure.fixedDeduction ?? 0) + halfDayDeduction;
+  const grossSalary = basicSalary + bonus;
+  const totalDeductions = leaveDeduction + fixedAndHalfDayDeduction;
+  const netSalary = grossSalary - totalDeductions;
 
   return {
     employee: employeeId,
-    organization: organizationId,
-    payrollPeriod: { month, year },
+    organization: resolvedOrganizationId,
+    payrollPeriod: {
+      month: period.month,
+      year: period.year,
+      startDate: period.startDate,
+      endDate: period.endDate
+    },
     salaryType,
-    baseSalary,
+    baseSalary: salaryType === 'hourly' ? basicSalary : baseSalary,
     hourlyRate,
     workingDays: {
       total: attendanceSummary.totalDays,
@@ -237,7 +272,7 @@ payrollSchema.statics.calculatePayroll = async function (employeeId, year, month
     },
     earnings: {
       basicSalary: Math.round(basicSalary * 100) / 100,
-      overtimePay: Math.round(overtimePay * 100) / 100,
+      overtimePay: 0,
       allowances: {
         transportation: 0,
         food: 0,
@@ -245,16 +280,19 @@ payrollSchema.statics.calculatePayroll = async function (employeeId, year, month
         housing: 0,
         other: 0,
       },
-      bonus: 0,
+      bonus,
+      grossSalary: Math.round(grossSalary * 100) / 100,
     },
     deductions: {
-      tax: Math.round(basicSalary * 0.1 * 100) / 100, // 10% tax
-      socialSecurity: Math.round(basicSalary * 0.05 * 100) / 100, // 5% social security
+      tax: 0,
+      socialSecurity: 0,
       insurance: 0,
       leaveDeduction: Math.round(leaveDeduction * 100) / 100,
       lateDeduction: 0,
-      other: 0,
+      other: Math.round(fixedAndHalfDayDeduction * 100) / 100,
+      totalDeductions: Math.round(totalDeductions * 100) / 100,
     },
+    netSalary: Math.round(netSalary * 100) / 100,
   };
 };
 

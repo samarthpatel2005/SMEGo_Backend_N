@@ -93,20 +93,10 @@ timesheetSchema.index({ employee: 1, organization: 1, date: 1 }, { unique: true 
 // Pre-save middleware to calculate total hours
 timesheetSchema.pre('save', function (next) {
   if (this.checkIn && this.checkOut && this.attendanceType === 'present') {
-    const diffMs = this.checkOut - this.checkIn;
-    const totalHours = diffMs / (1000 * 60 * 60); // Convert to hours
-
-    // Standard work day is 8 hours
+    const totalHours = (this.checkOut - this.checkIn) / (1000 * 60 * 60);
     const standardHours = 8;
-
-    if (totalHours <= standardHours) {
-      this.regularHours = totalHours;
-      this.overtimeHours = 0;
-    } else {
-      this.regularHours = standardHours;
-      this.overtimeHours = totalHours - standardHours;
-    }
-
+    this.regularHours = Math.min(totalHours, standardHours);
+    this.overtimeHours = Math.max(totalHours - standardHours, 0);
     this.totalHours = totalHours;
   } else if (this.attendanceType === 'half_day') {
     this.regularHours = 4;
@@ -117,23 +107,23 @@ timesheetSchema.pre('save', function (next) {
     this.overtimeHours = 0;
     this.totalHours = 0;
   }
-
   next();
 });
 
-// Static method to get monthly attendance summary
-timesheetSchema.statics.getMonthlyAttendanceSummary = async function (employeeId, year, month, organizationId) {
-  const startDate = new Date(year, month - 1, 1);
-  const endDate = new Date(year, month, 0);
+timesheetSchema.statics.getAttendanceSummary = async function (employeeId, startDate, endDate, organizationId) {
+  const rangeStart = new Date(startDate);
+  const rangeEnd = new Date(endDate);
+  rangeStart.setHours(0, 0, 0, 0);
+  rangeEnd.setHours(23, 59, 59, 999);
 
   const timesheets = await this.find({
     employee: employeeId,
     organization: organizationId,
-    date: { $gte: startDate, $lte: endDate }
+    date: { $gte: rangeStart, $lte: rangeEnd }
   });
 
   const summary = {
-    totalDays: endDate.getDate(),
+    totalDays: Math.floor((rangeEnd - rangeStart) / (1000 * 60 * 60 * 24)) + 1,
     presentDays: 0,
     absentDays: 0,
     leaveDays: 0,
@@ -141,31 +131,30 @@ timesheetSchema.statics.getMonthlyAttendanceSummary = async function (employeeId
     totalHours: 0,
     regularHours: 0,
     overtimeHours: 0,
-    timesheets: timesheets
+    timesheets
   };
 
   timesheets.forEach(timesheet => {
-    switch (timesheet.attendanceType) {
-      case 'present':
-        summary.presentDays++;
-        break;
-      case 'absent':
-        summary.absentDays++;
-        break;
-      case 'leave':
-        summary.leaveDays++;
-        break;
-      case 'half_day':
-        summary.halfDays++;
-        break;
-    }
-
+    if (timesheet.attendanceType === 'present') summary.presentDays++;
+    if (timesheet.attendanceType === 'absent') summary.absentDays++;
+    if (timesheet.attendanceType === 'leave') summary.leaveDays++;
+    if (timesheet.attendanceType === 'half_day') summary.halfDays++;
     summary.totalHours += timesheet.totalHours;
     summary.regularHours += timesheet.regularHours;
     summary.overtimeHours += timesheet.overtimeHours;
   });
 
   return summary;
+};
+
+// Preserve the existing monthly API used by attendance reporting.
+timesheetSchema.statics.getMonthlyAttendanceSummary = async function (employeeId, year, month, organizationId) {
+  return this.getAttendanceSummary(
+    employeeId,
+    new Date(year, month - 1, 1),
+    new Date(year, month, 0),
+    organizationId
+  );
 };
 
 module.exports = mongoose.model('Timesheet', timesheetSchema);

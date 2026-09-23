@@ -10,6 +10,8 @@ router.use(protect);
 
 // New payroll management routes
 router.get('/employees', payrollController.getEmployeesForPayroll);
+router.get('/structure/:employeeId', roleMiddleware(['admin', 'manager']), payrollController.getSalaryStructure);
+router.put('/structure/:employeeId', roleMiddleware(['admin', 'manager']), payrollController.updateSalaryStructure);
 router.post('/generate-for-employees', roleMiddleware(['admin', 'manager']), payrollController.generatePayrollForEmployees);
 router.post('/create-payment', roleMiddleware(['admin', 'manager']), payrollController.createPayrollPayment);
 router.post('/webhook/payment', payrollController.handlePayrollPaymentWebhook);
