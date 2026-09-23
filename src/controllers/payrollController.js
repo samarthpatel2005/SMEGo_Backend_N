@@ -339,8 +339,8 @@ const createPayrollPayment = async (req, res) => {
         type: 'payroll',
         payrollIds: payrollIds.join(','),
         organizationId: organizationId.toString(),
-        employeeCount: payrolls.length,
-        customAmount: customAmount || null
+        employeeCount: String(payrolls.length),
+        customAmount: customAmount ? String(customAmount) : ''
       }
     });
 
@@ -385,6 +385,69 @@ const createPayrollPayment = async (req, res) => {
       message: 'Failed to create payment',
       error: error.message
     });
+  }
+};
+
+// Verify and mark payroll as paid after successful Razorpay payment (for test/frontend callback)
+const verifyPayrollPayment = async (req, res) => {
+  try {
+    const { payrollIds, razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body;
+    const organizationId = getOrganizationId(req.user);
+
+    if (!payrollIds || !Array.isArray(payrollIds) || payrollIds.length === 0) {
+      return res.status(400).json({ success: false, message: 'Payroll IDs are required' });
+    }
+
+    // In test mode, trust the payment if we have razorpay_payment_id
+    const isTestMode = (process.env.RAZORPAY_KEY_ID || '').startsWith('rzp_test_');
+    let verified = false;
+
+    if (isTestMode && razorpay_payment_id) {
+      // Test mode: trust the callback — no webhook needed for localhost
+      verified = true;
+    } else if (razorpay_order_id && razorpay_payment_id && razorpay_signature) {
+      // Production: verify HMAC signature
+      const crypto = require('crypto');
+      const body = razorpay_order_id + '|' + razorpay_payment_id;
+      const expectedSignature = crypto
+        .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
+        .update(body)
+        .digest('hex');
+      verified = expectedSignature === razorpay_signature;
+    }
+
+    if (!verified) {
+      return res.status(400).json({ success: false, message: 'Payment verification failed' });
+    }
+
+    // Mark payrolls as paid
+    const result = await Payroll.updateMany(
+      {
+        _id: { $in: payrollIds },
+        organization: organizationId,
+        status: 'approved'
+      },
+      {
+        $set: {
+          status: 'paid',
+          paidAt: new Date(),
+          paymentMethod: 'razorpay',
+          paymentReference: razorpay_payment_id,
+          paymentDate: new Date()
+        }
+      }
+    );
+
+    console.log(`Payroll payment verified: ${result.modifiedCount} records marked as paid. Payment: ${razorpay_payment_id}`);
+
+    res.json({
+      success: true,
+      message: `${result.modifiedCount} payroll(s) marked as paid`,
+      modifiedCount: result.modifiedCount
+    });
+  } catch (error) {
+    console.error('Verify payroll payment error:', error);
+    res.status(500).json({ success: false, message: 'Payment verification failed', error: error.message });
   }
 };
 
@@ -597,14 +660,133 @@ const resetPayrollStatus = async (req, res) => {
   }
 };
 
+// Get payroll summary for a period — totals across all employees
+const getPayrollSummary = async (req, res) => {
+  try {
+    const { year, month, startDate, endDate } = req.query;
+    const organizationId = getOrganizationId(req.user);
+
+    let period;
+    try {
+      period = getPayrollPeriod({ year, month, startDate, endDate });
+    } catch (error) {
+      return res.status(400).json({ success: false, message: error.message });
+    }
+
+    // Fetch all active employees
+    const employees = await Employee.find({
+      organization: organizationId,
+      isActive: true
+    }).select('fullName employeeId department position salaryStructure');
+
+    const totalDaysInPeriod = Math.round(
+      (period.endDate - period.startDate) / (1000 * 60 * 60 * 24)
+    ) + 1;
+
+    let summaryRows = [];
+    let grandTotalPayable = 0;
+    let grandTotalAbsentDeduction = 0;
+    let grandTotalLeaveDeduction = 0;
+    let grandTotalBonus = 0;
+    let grandTotalPresent = 0;
+    let grandTotalAbsent = 0;
+
+    for (const employee of employees) {
+      if (!employee.salaryStructure || !employee.salaryStructure.salaryType) continue;
+
+      const attendance = await Timesheet.getAttendanceSummary(
+        employee._id,
+        period.startDate,
+        period.endDate,
+        organizationId
+      );
+
+      const structure = employee.salaryStructure;
+      const monthlySalary = structure.salary || 0;
+      const perDaySalary = structure.salaryType === 'monthly'
+        ? monthlySalary / totalDaysInPeriod
+        : (structure.hourlyRate || 0) * 8;
+
+      const effectiveDays = attendance.presentDays + (attendance.halfDays * 0.5);
+      const earnedSalary = perDaySalary * effectiveDays;
+      const absentDeduction = perDaySalary * attendance.absentDays;
+      const leaveRatePerDay = (structure.leaveDeductionPerDay && structure.leaveDeductionPerDay > 0)
+        ? structure.leaveDeductionPerDay
+        : perDaySalary;
+      const leaveDeduction = leaveRatePerDay * attendance.leaveDays;
+      const bonus = structure.bonus || 0;
+      const fixedDeduction = structure.fixedDeduction || 0;
+      const netPayable = Math.max(earnedSalary + bonus - fixedDeduction - leaveDeduction, 0);
+
+      grandTotalPayable += netPayable;
+      grandTotalAbsentDeduction += absentDeduction;
+      grandTotalLeaveDeduction += leaveDeduction;
+      grandTotalBonus += bonus;
+      grandTotalPresent += attendance.presentDays;
+      grandTotalAbsent += attendance.absentDays;
+
+      summaryRows.push({
+        employee: {
+          _id: employee._id,
+          fullName: employee.fullName,
+          employeeId: employee.employeeId,
+          department: employee.department,
+        },
+        monthlySalary,
+        perDaySalary: Math.round(perDaySalary * 100) / 100,
+        totalDaysInPeriod,
+        effectiveDays: Math.round(effectiveDays * 100) / 100,
+        presentDays: attendance.presentDays,
+        absentDays: attendance.absentDays,
+        halfDays: attendance.halfDays,
+        leaveDays: attendance.leaveDays,
+        earnedSalary: Math.round(earnedSalary * 100) / 100,
+        absentDeduction: Math.round(absentDeduction * 100) / 100,
+        leaveDeduction: Math.round(leaveDeduction * 100) / 100,
+        bonus,
+        fixedDeduction,
+        netPayable: Math.round(netPayable * 100) / 100,
+      });
+    }
+
+    res.json({
+      success: true,
+      data: {
+        period: {
+          year: period.year,
+          month: period.month,
+          startDate: period.startDate.toISOString().slice(0, 10),
+          endDate: period.endDate.toISOString().slice(0, 10),
+          totalDays: totalDaysInPeriod,
+        },
+        totals: {
+          totalPayable: Math.round(grandTotalPayable * 100) / 100,
+          totalAbsentDeduction: Math.round(grandTotalAbsentDeduction * 100) / 100,
+          totalLeaveDeduction: Math.round(grandTotalLeaveDeduction * 100) / 100,
+          totalBonus: Math.round(grandTotalBonus * 100) / 100,
+          totalPresentDays: grandTotalPresent,
+          totalAbsentDays: grandTotalAbsent,
+          employeeCount: summaryRows.length,
+        },
+        employees: summaryRows,
+      }
+    });
+  } catch (error) {
+    console.error('Get payroll summary error:', error);
+    res.status(500).json({ success: false, message: 'Internal server error', error: error.message });
+  }
+};
+
 module.exports = {
   getSalaryStructure,
   updateSalaryStructure,
   getEmployeesForPayroll,
   generatePayrollForEmployees,
   createPayrollPayment,
+  verifyPayrollPayment,
   handlePayrollPaymentWebhook,
   getPayrolls,
   deletePayrolls,
-  resetPayrollStatus
+  resetPayrollStatus,
+  getPayrollSummary
 };

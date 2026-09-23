@@ -45,6 +45,24 @@ const payrollSchema = new mongoose.Schema(
     hourlyRate: {
       type: Number, // Used for hourly employees
     },
+    // --- Attendance-based breakdown fields ---
+    perDaySalary: {
+      type: Number,
+      default: 0,
+    },
+    effectiveDays: {
+      type: Number,
+      default: 0,
+    },
+    earnedBasicSalary: {
+      type: Number,
+      default: 0,
+    },
+    absentDeduction: {
+      type: Number,
+      default: 0,
+    },
+    // -----------------------------------------
     workingDays: {
       total: { type: Number, default: 0 },
       present: { type: Number, default: 0 },
@@ -75,6 +93,7 @@ const payrollSchema = new mongoose.Schema(
       socialSecurity: { type: Number, default: 0 },
       insurance: { type: Number, default: 0 },
       leaveDeduction: { type: Number, default: 0 },
+      absentDeduction: { type: Number, default: 0 },
       lateDeduction: { type: Number, default: 0 },
       other: { type: Number, default: 0 },
       totalDeductions: { type: Number, default: 0 },
@@ -172,6 +191,7 @@ payrollSchema.pre('save', function (next) {
     this.deductions.socialSecurity +
     this.deductions.insurance +
     this.deductions.leaveDeduction +
+    this.deductions.absentDeduction +
     this.deductions.lateDeduction +
     this.deductions.other;
 
@@ -181,7 +201,20 @@ payrollSchema.pre('save', function (next) {
   next();
 });
 
-// Static method to calculate payroll for an employee
+/**
+ * Attendance-based payroll calculation.
+ *
+ * Formula (monthly salary type):
+ *   perDaySalary       = monthlySalary / totalDaysInPeriod
+ *   effectiveDays      = presentDays + (halfDays × 0.5)
+ *   earnedBasicSalary  = perDaySalary × effectiveDays
+ *   absentDeduction    = perDaySalary × absentDays
+ *   leaveDeduction     = perDaySalary × leaveDays   (unpaid leave)
+ *   netSalary          = earnedBasicSalary + bonus - fixedDeduction
+ *
+ * The leaveDeductionPerDay in the salary structure acts as an override;
+ * if it is 0 (or not set), the system auto-computes it from perDaySalary.
+ */
 payrollSchema.statics.calculatePayroll = async function (employeeId, periodOrYear, monthOrOrganizationId, organizationId) {
   const Employee = mongoose.model('Employee');
   const Timesheet = mongoose.model('Timesheet');
@@ -204,12 +237,14 @@ payrollSchema.statics.calculatePayroll = async function (employeeId, periodOrYea
   const resolvedOrganizationId = period.organizationId || (
     typeof periodOrYear === 'object' ? monthOrOrganizationId : organizationId
   );
+
   const attendanceSummary = await Timesheet.getAttendanceSummary(
     employeeId,
     period.startDate,
     period.endDate,
     resolvedOrganizationId
   );
+
   // Determine salary type and base salary
   const structure = employee.salaryStructure;
   if (!structure || !structure.salaryType) {
@@ -219,32 +254,65 @@ payrollSchema.statics.calculatePayroll = async function (employeeId, periodOrYea
   const salaryType = structure.salaryType;
   const baseSalary = structure.salary || 0;
   const hourlyRate = structure.hourlyRate || 0;
+  const bonus = structure.bonus ?? 0;
+  const fixedDeduction = structure.fixedDeduction ?? 0;
 
-  // Calculate basic salary based on type
+  // Total calendar days in the payroll period
+  const totalDaysInPeriod = attendanceSummary.totalDays || 1;
+
   let basicSalary = 0;
+  let perDaySalary = 0;
+  let effectiveDays = 0;
+  let earnedBasicSalary = 0;
+  let absentDeductionAmt = 0;
+  let leaveDeductionAmt = 0;
+  let halfDayDeductionAmt = 0;
+  let overtimePay = 0;
+
   if (salaryType === 'monthly') {
-    // Attendance-based leave and half-day adjustments are applied as deductions below.
-    basicSalary = baseSalary;
+    // Auto per-day rate
+    perDaySalary = baseSalary / totalDaysInPeriod;
+
+    // effectiveDays = present days + half-days counted as 0.5
+    effectiveDays = attendanceSummary.presentDays + (attendanceSummary.halfDays * 0.5);
+
+    // Earned basic salary = only for days actually worked
+    earnedBasicSalary = perDaySalary * effectiveDays;
+
+    // Absent deduction (auto) — days marked absent
+    absentDeductionAmt = perDaySalary * attendanceSummary.absentDays;
+
+    // Leave deduction — use override if set, else auto per-day rate
+    const leaveRatePerDay = (structure.leaveDeductionPerDay && structure.leaveDeductionPerDay > 0)
+      ? structure.leaveDeductionPerDay
+      : perDaySalary;
+    leaveDeductionAmt = leaveRatePerDay * attendanceSummary.leaveDays;
+
+    // Half-day already factored into effectiveDays above;
+    // if an explicit halfDayDeductionPerDay is set, use it as additional deduction
+    if (structure.halfDayDeductionPerDay && structure.halfDayDeductionPerDay > 0) {
+      halfDayDeductionAmt = structure.halfDayDeductionPerDay * attendanceSummary.halfDays;
+      // Recompute earnedBasicSalary without half-day 0.5 factor, add explicit deduction instead
+      effectiveDays = attendanceSummary.presentDays + attendanceSummary.halfDays; // count half-days as full for base
+      earnedBasicSalary = perDaySalary * effectiveDays - halfDayDeductionAmt;
+    }
+
+    basicSalary = earnedBasicSalary;
+
   } else {
-    // For hourly salary
+    // Hourly salary — pay for hours worked
     basicSalary = attendanceSummary.totalHours * hourlyRate;
+    earnedBasicSalary = basicSalary;
+    perDaySalary = hourlyRate * 8; // 8h reference day
+    effectiveDays = attendanceSummary.presentDays + (attendanceSummary.halfDays * 0.5);
+
+    // Overtime pay (1.5× rate)
+    overtimePay = attendanceSummary.overtimeHours * hourlyRate * 1.5;
   }
 
-  const dailySalary = salaryType === 'monthly'
-    ? baseSalary / Math.max(attendanceSummary.totalDays, 1)
-    : 0;
-  const unpaidLeaveDays = attendanceSummary.absentDays + attendanceSummary.leaveDays;
-  const leaveDeduction = salaryType === 'monthly'
-    ? unpaidLeaveDays * (structure.leaveDeductionPerDay ?? dailySalary)
-    : 0;
-  const halfDayDeduction = salaryType === 'monthly'
-    ? attendanceSummary.halfDays * (structure.halfDayDeductionPerDay ?? dailySalary * 0.5)
-    : 0;
-  const bonus = structure.bonus ?? 0;
-  const fixedAndHalfDayDeduction = (structure.fixedDeduction ?? 0) + halfDayDeduction;
-  const grossSalary = basicSalary + bonus;
-  const totalDeductions = leaveDeduction + fixedAndHalfDayDeduction;
-  const netSalary = grossSalary - totalDeductions;
+  const grossSalary = basicSalary + bonus + overtimePay;
+  const totalDeductions = absentDeductionAmt + leaveDeductionAmt + fixedDeduction;
+  const netSalary = Math.max(grossSalary - totalDeductions, 0);
 
   return {
     employee: employeeId,
@@ -258,6 +326,11 @@ payrollSchema.statics.calculatePayroll = async function (employeeId, periodOrYea
     salaryType,
     baseSalary: salaryType === 'hourly' ? basicSalary : baseSalary,
     hourlyRate,
+    // Attendance-based breakdown
+    perDaySalary: Math.round(perDaySalary * 100) / 100,
+    effectiveDays: Math.round(effectiveDays * 100) / 100,
+    earnedBasicSalary: Math.round(earnedBasicSalary * 100) / 100,
+    absentDeduction: Math.round(absentDeductionAmt * 100) / 100,
     workingDays: {
       total: attendanceSummary.totalDays,
       present: attendanceSummary.presentDays,
@@ -272,7 +345,7 @@ payrollSchema.statics.calculatePayroll = async function (employeeId, periodOrYea
     },
     earnings: {
       basicSalary: Math.round(basicSalary * 100) / 100,
-      overtimePay: 0,
+      overtimePay: Math.round(overtimePay * 100) / 100,
       allowances: {
         transportation: 0,
         food: 0,
@@ -287,9 +360,10 @@ payrollSchema.statics.calculatePayroll = async function (employeeId, periodOrYea
       tax: 0,
       socialSecurity: 0,
       insurance: 0,
-      leaveDeduction: Math.round(leaveDeduction * 100) / 100,
+      leaveDeduction: Math.round(leaveDeductionAmt * 100) / 100,
+      absentDeduction: Math.round(absentDeductionAmt * 100) / 100,
       lateDeduction: 0,
-      other: Math.round(fixedAndHalfDayDeduction * 100) / 100,
+      other: Math.round(fixedDeduction * 100) / 100,
       totalDeductions: Math.round(totalDeductions * 100) / 100,
     },
     netSalary: Math.round(netSalary * 100) / 100,
