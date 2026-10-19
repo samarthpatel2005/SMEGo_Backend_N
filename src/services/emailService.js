@@ -19,8 +19,8 @@ class EmailService {
 
   async sendEmail({ to, subject, html }) {
     const mailOptions = {
-      from: process.env.FROM_EMAIL,
-      to,
+      from: process.env.FROM_EMAIL || process.env.SMTP_USER,
+      to: typeof to === 'string' ? to.trim().toLowerCase() : to,
       subject,
       html
     };

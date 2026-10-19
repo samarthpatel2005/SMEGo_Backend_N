@@ -9,6 +9,7 @@ const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const emailService = require('../services/emailService');
 const { generateToken } = require('../utils/generateToken');
+const { validateEmail } = require('../utils/validators');
 
 // Step 1: Validate organization data (doesn't create yet)
 async function createOrganization(req, res) {
@@ -106,6 +107,13 @@ async function createAdmin(req, res) {
     }
 
     const normalizedEmail = typeof email === 'string' ? email.trim().toLowerCase() : '';
+
+    if (!validateEmail(normalizedEmail)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Please enter a valid email address'
+      });
+    }
 
     if (!fullName || !normalizedEmail || !password) {
       console.log('❌ Required admin fields missing');
@@ -319,6 +327,23 @@ async function selectPlan(req, res) {
     console.log('💳 Creating subscription for plan:', plan.name);
     
     // Create subscription with correct field names matching the model
+    const existingSubscription = await Subscription.findOne({
+      organization: admin.organization._id,
+      planId: plan._id,
+      status: { $in: ['trial', 'active'] }
+    });
+
+    if (existingSubscription) {
+      return res.status(200).json({
+        success: true,
+        message: 'Plan already selected successfully!',
+        data: {
+          subscription: existingSubscription,
+          redirectTo: '/dashboard'
+        }
+      });
+    }
+
     const subscriptionData = {
       userId: admin._id, // Required field
       userModel: 'Admin', // Specify this is an Admin reference
@@ -388,7 +413,7 @@ async function selectPlan(req, res) {
 // Resend OTP
 async function resendOtp(req, res) {
   try {
-    const { email } = req.body;
+    const email = typeof req.body.email === 'string' ? req.body.email.trim().toLowerCase() : '';
 
     const admin = await Admin.findOne({ email, isEmailVerified: false });
 
